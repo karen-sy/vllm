@@ -71,6 +71,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _request_completed_successfully(request: Request) -> bool:
+    return request.status in (
+        RequestStatus.FINISHED_STOPPED,
+        RequestStatus.FINISHED_LENGTH_CAPPED,
+        RequestStatus.FINISHED_REPETITION,
+    )
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -2490,6 +2498,9 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if _request_completed_successfully(request):
+            self.kv_cache_manager.apply_request_completion_retention(request)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2517,6 +2528,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if _request_completed_successfully(request):
+            self.kv_cache_manager.apply_request_completion_eviction(request)
         del self.requests[request.request_id]
 
     @property

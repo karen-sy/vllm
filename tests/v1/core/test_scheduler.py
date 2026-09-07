@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -120,6 +121,36 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+def test_kv_hints_execute_at_successful_request_completion():
+    scheduler = object.__new__(Scheduler)
+    completion = Mock()
+    scheduler._inflight_prefills = set()
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.encoder_cache_manager = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.defer_block_free = False
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.apply_request_completion_retention = completion.retain
+    scheduler.kv_cache_manager.free = completion.free
+    scheduler.kv_cache_manager.apply_request_completion_eviction = completion.evict
+    request = create_requests(num_requests=1)[0]
+    request.status = RequestStatus.FINISHED_STOPPED
+    request.kv_hints = KvHintsEnvelope(
+        protocol_version="1.0", message_id="message-1", actions=[]
+    )
+    scheduler.requests = {request.request_id: request}
+
+    scheduler._free_request(request)
+
+    assert completion.mock_calls == [
+        call.retain(request),
+        call.free(request),
+        call.evict(request),
+    ]
 
 
 def test_finish_request():

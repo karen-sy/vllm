@@ -39,6 +39,7 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     init_none_hash,
     make_block_hash_with_group_id,
+    maybe_convert_block_hash,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -50,6 +51,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.kv_hints import KvHintAction, KvHintsEnvelope
 
 pytestmark = pytest.mark.cpu_test
 
@@ -119,6 +121,12 @@ def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheMa
             prefix_cache_retention_interval=kwargs.pop("retention_interval"),
         )
     return KVCacheManager(kv_cache_config, **kwargs)
+
+
+def request_with_kv_hints(
+    kv_hints: KvHintsEnvelope, block_hashes: list[BlockHash] | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(kv_hints=kv_hints, block_hashes=block_hashes or [])
 
 
 def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
@@ -2135,6 +2143,271 @@ def test_maybe_evict_cached_block():
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
+
+
+def test_kv_evict_resolves_external_hash_to_all_g1_copies():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size=16, num_blocks=5),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(4)
+    block_hash = BlockHash(b"shared-prefix")
+    for block, group_id in zip(blocks[:3], (0, 0, 1)):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(block_hash, group_id),
+            block,
+            num_tokens=16,
+        )
+    current_request_hash = BlockHash(b"current-request")
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(current_request_hash, 0),
+        blocks[3],
+        num_tokens=16,
+    )
+
+    external_hash = maybe_convert_block_hash(block_hash)
+    payload_hash = (
+        external_hash
+        if isinstance(external_hash, int)
+        else f"hex:{external_hash.hex()}"
+    )
+    manager.apply_request_completion_eviction(
+        request_with_kv_hints(
+            KvHintsEnvelope(
+                protocol_version="1.0",
+                message_id="message-1",
+                actions=[
+                    KvHintAction(
+                        action_id="invalid-retain",
+                        action_type="kv.retain",
+                        action_version="1.0",
+                        payload={
+                            "block_hashes": [payload_hash],
+                            "execute_at": "request_completion",
+                            "priority": "high",
+                            "ttl_seconds": 30,
+                        },
+                    ),
+                    KvHintAction(
+                        action_id="evict-1",
+                        action_type="kv.evict",
+                        action_version="1.0",
+                        payload={
+                            "block_hashes": [payload_hash],
+                            "execute_at": "request_completion",
+                            "include_current_request": True,
+                        },
+                    ),
+                ],
+            ),
+            [current_request_hash],
+        )
+    )
+
+    assert pool.get_blocks_by_external_hashes([external_hash]) == []
+    assert all(block.block_hash is None for block in blocks)
+    assert all(block.ref_cnt == 1 for block in blocks)
+
+
+def test_kv_retain_biases_eviction_without_pinning():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size=16, num_blocks=3),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(2)
+    block_hashes = [BlockHash(b"retained"), BlockHash(b"ordinary")]
+    for block, block_hash in zip(blocks, block_hashes):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(block_hash, 0),
+            block,
+            num_tokens=16,
+        )
+
+    retained_hash = maybe_convert_block_hash(block_hashes[0])
+    manager.apply_request_completion_retention(
+        request_with_kv_hints(
+            KvHintsEnvelope(
+                protocol_version="1.0",
+                message_id="message-1",
+                actions=[
+                    KvHintAction(
+                        action_id="retain-1",
+                        action_type="kv.retain",
+                        action_version="1.0",
+                        payload={
+                            "block_hashes": [retained_hash],
+                            "execute_at": "request_completion",
+                            "priority": 10,
+                            "ttl_seconds": 30,
+                        },
+                    )
+                ],
+            )
+        )
+    )
+    pool.free_blocks(blocks)
+
+    assert pool.get_new_blocks(1) == [blocks[1]]
+    assert pool.get_blocks_by_external_hashes([retained_hash]) == [blocks[0]]
+    assert pool.get_new_blocks(1) == [blocks[0]]
+    assert pool.get_blocks_by_external_hashes([retained_hash]) == []
+
+
+def test_block_id_eviction_returns_retained_block_to_free_queue():
+    pool = BlockPool(num_gpu_blocks=2, enable_caching=True, hash_block_size=16)
+    block = pool.get_new_blocks(1)[0]
+    block_hash = BlockHash(b"retained")
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(block_hash, 0), block, num_tokens=16
+    )
+    pool.retain_external_blocks(
+        [maybe_convert_block_hash(block_hash)],
+        lease_id="retain-1",
+        priority=10,
+        ttl_seconds=30,
+    )
+    pool.free_blocks([block])
+
+    pool.evict_blocks({block.block_id})
+
+    assert pool.get_num_free_blocks() == 1
+    assert pool.get_new_blocks(1) == [block]
+
+
+def test_copy_on_write_moves_retention_with_cached_hashes():
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=True, hash_block_size=16)
+    src, dst = pool.get_new_blocks(2)
+    block_hash = BlockHash(b"copy-on-write")
+    external_hash = maybe_convert_block_hash(block_hash)
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(block_hash, 0), src, num_tokens=16
+    )
+    pool.retain_external_blocks(
+        [external_hash], lease_id="retain-1", priority=10, ttl_seconds=30
+    )
+
+    pool.move_block_hashes(src, dst)
+    pool.free_blocks([src, dst])
+
+    assert pool.get_new_blocks(1) == [src]
+    assert pool.get_blocks_by_external_hashes([external_hash]) == [dst]
+
+
+def test_reset_prefix_cache_clears_retention():
+    pool = BlockPool(num_gpu_blocks=2, enable_caching=True, hash_block_size=16)
+    block = pool.get_new_blocks(1)[0]
+    block_hash = BlockHash(b"retained")
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(block_hash, 0), block, num_tokens=16
+    )
+    pool.retain_external_blocks(
+        [maybe_convert_block_hash(block_hash)],
+        lease_id="retain-1",
+        priority=10,
+        ttl_seconds=30,
+    )
+    pool.free_blocks([block])
+
+    assert pool.reset_prefix_cache()
+    assert len(pool.retained_block_queue) == 0
+    assert pool.get_num_free_blocks() == 1
+
+
+def test_kv_retain_uses_all_live_leases(monkeypatch: pytest.MonkeyPatch):
+    now = [0.0]
+    monkeypatch.setattr(
+        "vllm.v1.core.retained_block_queue.time.monotonic", lambda: now[0]
+    )
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size=16, num_blocks=3),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(2)
+    block_hashes = [BlockHash(b"multi-lease"), BlockHash(b"medium-priority")]
+    external_hashes = [maybe_convert_block_hash(value) for value in block_hashes]
+    for block, block_hash in zip(blocks, block_hashes):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(block_hash, 0),
+            block,
+            num_tokens=16,
+        )
+
+    for message_id, action_id, block_idx, priority, ttl_seconds in (
+        ("message-long", "shared-action", 0, 1, 20),
+        ("message-short", "shared-action", 0, 10, 5),
+        ("message-medium", "medium-action", 1, 5, 20),
+    ):
+        manager.apply_request_completion_retention(
+            request_with_kv_hints(
+                KvHintsEnvelope(
+                    protocol_version="1.0",
+                    message_id=message_id,
+                    actions=[
+                        KvHintAction(
+                            action_id=action_id,
+                            action_type="kv.retain",
+                            action_version="1.0",
+                            payload={
+                                "block_hashes": [external_hashes[block_idx]],
+                                "execute_at": "request_completion",
+                                "priority": priority,
+                                "ttl_seconds": ttl_seconds,
+                            },
+                        )
+                    ],
+                )
+            )
+        )
+    pool.free_blocks(blocks)
+    now[0] = 10
+    pool._release_expired_retention()
+
+    assert blocks[0] in pool.retained_block_queue
+    assert pool.get_new_blocks(1) == [blocks[0]]
+
+
+def test_kv_retain_expiry_restores_lru_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = [0.0]
+    monkeypatch.setattr(
+        "vllm.v1.core.retained_block_queue.time.monotonic", lambda: now[0]
+    )
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size=16, num_blocks=3),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    pool = manager.block_pool
+    blocks = pool.get_new_blocks(2)
+    block_hashes = [BlockHash(b"expires"), BlockHash(b"ordinary")]
+    for block, block_hash in zip(blocks, block_hashes):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(block_hash, 0),
+            block,
+            num_tokens=16,
+        )
+
+    pool.retain_external_blocks(
+        [maybe_convert_block_hash(block_hashes[0])],
+        lease_id="short",
+        priority=10,
+        ttl_seconds=5,
+    )
+    pool.free_blocks(blocks)
+    now[0] = 10
+
+    assert pool.get_new_blocks(1) == [blocks[0]]
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
