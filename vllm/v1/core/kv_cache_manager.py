@@ -14,7 +14,12 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    ExternalBlockHash,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    maybe_convert_block_hash,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -23,6 +28,14 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+)
+from vllm.v1.kv_hints.actions import (
+    EVICT_ACTION_TYPE,
+    RETAIN_ACTION_TYPE,
+    EvictBlocksAction,
+    RetainBlocksAction,
+    parse_block_action,
+    supports_envelope,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -612,6 +625,76 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    @staticmethod
+    def _parse_request_completion_actions(
+        request: Request, action_type: str
+    ) -> list[EvictBlocksAction | RetainBlocksAction]:
+        kv_hints = request.kv_hints
+        if kv_hints is None or not supports_envelope(kv_hints):
+            return []
+        parsed_actions: list[EvictBlocksAction | RetainBlocksAction] = []
+        for action in kv_hints.actions:
+            if action.action_type != action_type:
+                continue
+            try:
+                parsed_action = parse_block_action(action)
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping invalid KV hint action %s: %s", action.action_id, exc
+                )
+                continue
+            if parsed_action is not None:
+                parsed_actions.append(parsed_action)
+        return parsed_actions
+
+    @staticmethod
+    def _resolve_request_completion_hashes(
+        request: Request,
+        block_hashes: tuple[ExternalBlockHash, ...],
+        include_current_request: bool,
+    ) -> tuple[ExternalBlockHash, ...]:
+        resolved = dict.fromkeys(block_hashes)
+        if include_current_request:
+            resolved.update(
+                (maybe_convert_block_hash(block_hash), None)
+                for block_hash in request.block_hashes
+            )
+        return tuple(resolved)
+
+    def apply_request_completion_retention(self, request: Request) -> None:
+        """Apply deferred retention before releasing request block references."""
+        kv_hints = request.kv_hints
+        if kv_hints is None:
+            return
+        for action in self._parse_request_completion_actions(
+            request, RETAIN_ACTION_TYPE
+        ):
+            assert isinstance(action, RetainBlocksAction)
+            self.block_pool.retain_external_blocks(
+                self._resolve_request_completion_hashes(
+                    request,
+                    action.block_hashes,
+                    action.include_current_request,
+                ),
+                lease_id=(kv_hints.message_id, action.action_id),
+                priority=action.priority,
+                ttl_seconds=action.ttl_seconds,
+            )
+
+    def apply_request_completion_eviction(self, request: Request) -> None:
+        """Apply deferred eviction after releasing request block references."""
+        for action in self._parse_request_completion_actions(
+            request, EVICT_ACTION_TYPE
+        ):
+            assert isinstance(action, EvictBlocksAction)
+            self.block_pool.evict_external_blocks(
+                self._resolve_request_completion_hashes(
+                    request,
+                    action.block_hashes,
+                    action.include_current_request,
+                )
+            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
