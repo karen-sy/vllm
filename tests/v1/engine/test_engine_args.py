@@ -20,6 +20,7 @@ def test_prefix_caching_from_cli():
         "V1 turns on prefix caching by default."
     )
     assert vllm_config.cache_config.prefix_cache_retention_interval == 0
+    assert vllm_config.cache_config.kv_cache_retention_max_fraction == 1.0
 
     # Turn it off possible with flag.
     args = parser.parse_args(["--no-enable-prefix-caching"])
@@ -52,6 +53,10 @@ def test_prefix_caching_from_cli():
     args = parser.parse_args(["--prefix-cache-retention-interval", "64"])
     vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
     assert vllm_config.cache_config.prefix_cache_retention_interval == 64
+
+    args = parser.parse_args(["--kv-cache-retention-max-fraction", "0.25"])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.cache_config.kv_cache_retention_max_fraction == 0.25
 
 
 @pytest.mark.parametrize(

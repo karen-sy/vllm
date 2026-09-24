@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Hashable, Iterable, Sequence
 from typing import Any
 
@@ -170,6 +171,8 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        retention_max_fraction: Maximum fraction of physical blocks that may
+            carry orchestrator-provided retention leases.
     """
 
     def __init__(
@@ -179,9 +182,12 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        retention_max_fraction: float = 1.0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        assert 0 <= retention_max_fraction <= 1
         self.num_gpu_blocks = num_gpu_blocks
+        self.max_retained_blocks = int(num_gpu_blocks * retention_max_fraction)
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
@@ -200,6 +206,7 @@ class BlockPool:
             ExternalBlockHash, set[BlockHashWithGroupId]
         ] = {}
         self.retained_block_queue = RetainedBlockQueue()
+        self._log_retention_occupancy("initialized", force=True)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -682,7 +689,9 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         self.retained_block_queue.move_leases(src_block, dst_block)
+        self._log_retention_occupancy("move", previous=retained_blocks)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -701,6 +710,7 @@ class BlockPool:
 
         num_lru_blocks = min(num_blocks, self.free_block_queue.num_free_blocks)
         ret = self.free_block_queue.popleft_n(num_lru_blocks)
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         for _ in range(num_blocks - num_lru_blocks):
             retained_block = self.retained_block_queue.pop_lowest()
             assert retained_block is not None
@@ -720,6 +730,7 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        self._log_retention_occupancy("forced_reuse", previous=retained_blocks)
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -818,8 +829,10 @@ class BlockPool:
     def evict_external_blocks(self, block_hashes: Iterable[ExternalBlockHash]) -> None:
         """Evict all G1 copies addressed by external logical block hashes."""
         self._release_expired_retention()
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         for block in self.get_blocks_by_external_hashes(block_hashes):
             self._maybe_evict_cached_block(block)
+        self._log_retention_occupancy("external_eviction", previous=retained_blocks)
 
     def retain_external_blocks(
         self,
@@ -827,10 +840,26 @@ class BlockPool:
         lease_id: Hashable,
         priority: int,
         ttl_seconds: float,
-    ) -> None:
+    ) -> bool:
         """Apply a bounded eviction-priority lease to matching G1 copies."""
         self._release_expired_retention()
-        for block in self.get_blocks_by_external_hashes(block_hashes):
+        blocks = self.get_blocks_by_external_hashes(block_hashes)
+        new_retained_blocks = sum(
+            not self.retained_block_queue.is_retained(block) for block in blocks
+        )
+        retained_blocks = self.retained_block_queue.num_retained_blocks
+        if retained_blocks + new_retained_blocks > self.max_retained_blocks:
+            logger.info(
+                "Skipping KV retention lease %r: %d retained + %d new blocks "
+                "would exceed the %d-block worker cap",
+                lease_id,
+                retained_blocks,
+                new_retained_blocks,
+                self.max_retained_blocks,
+            )
+            return False
+
+        for block in blocks:
             if block.ref_cnt == 0 and block not in self.retained_block_queue:
                 self.free_block_queue.remove(block)
             self.retained_block_queue.retain(
@@ -839,9 +868,32 @@ class BlockPool:
                 priority=priority,
                 ttl_seconds=ttl_seconds,
             )
+        self._log_retention_occupancy("retained", previous=retained_blocks, force=True)
+        return True
 
     def _release_expired_retention(self) -> None:
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         self.free_block_queue.prepend_n(self.retained_block_queue.expire())
+        self._log_retention_occupancy("expired", previous=retained_blocks)
+
+    def _log_retention_occupancy(
+        self,
+        reason: str,
+        previous: int | None = None,
+        force: bool = False,
+    ) -> None:
+        retained_blocks = self.retained_block_queue.num_retained_blocks
+        if not force and retained_blocks == previous:
+            return
+        logger.info(
+            "KV retention occupancy: reason=%s retained_blocks=%d "
+            "total_blocks=%d retained_fraction=%.6f event_time_seconds=%.6f",
+            reason,
+            retained_blocks,
+            self.num_gpu_blocks,
+            retained_blocks / self.num_gpu_blocks,
+            time.time(),
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -853,6 +905,7 @@ class BlockPool:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         for block_id in block_ids:
             assert block_id < len(self.blocks), (
                 f"Invalid block_id {block_id} >= {len(self.blocks)}. "
@@ -861,6 +914,7 @@ class BlockPool:
             )
             block = self.blocks[block_id]
             self._maybe_evict_cached_block(block)
+        self._log_retention_occupancy("block_eviction", previous=retained_blocks)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -884,7 +938,9 @@ class BlockPool:
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
         self.external_block_hash_to_internal.clear()
+        retained_blocks = self.retained_block_queue.num_retained_blocks
         self.free_block_queue.append_n(self.retained_block_queue.drain())
+        self._log_retention_occupancy("reset", previous=retained_blocks)
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

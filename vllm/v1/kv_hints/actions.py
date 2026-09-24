@@ -29,6 +29,8 @@ class RetainBlocksAction:
     include_current_request: bool
     priority: int
     ttl_seconds: float
+    current_request_block_start: int | None
+    current_request_block_count: int | None
 
 
 BlockAction: TypeAlias = EvictBlocksAction | RetainBlocksAction
@@ -75,14 +77,39 @@ def parse_block_action(action: KvHintAction) -> BlockAction | None:
         if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
             raise ValueError("kv.retain ttl_seconds must be positive and finite")
 
+        current_request_block_start = _parse_optional_nonnegative_int(
+            action, "current_request_block_start"
+        )
+        current_request_block_count = _parse_optional_nonnegative_int(
+            action, "current_request_block_count"
+        )
+        if (current_request_block_start is None) != (
+            current_request_block_count is None
+        ):
+            raise ValueError(
+                "kv.retain current request block start and count must be set together"
+            )
+        if current_request_block_count == 0:
+            raise ValueError("kv.retain current_request_block_count must be positive")
         return RetainBlocksAction(
             action_id=action.action_id,
             block_hashes=_parse_block_hashes(action),
             include_current_request=include_current_request,
             priority=priority,
             ttl_seconds=ttl_seconds,
+            current_request_block_start=current_request_block_start,
+            current_request_block_count=current_request_block_count,
         )
     return None
+
+
+def _parse_optional_nonnegative_int(action: KvHintAction, field: str) -> int | None:
+    value = action.payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"kv.retain {field} must be a non-negative integer")
+    return value
 
 
 def _parse_block_hashes(action: KvHintAction) -> tuple[ExternalBlockHash, ...]:

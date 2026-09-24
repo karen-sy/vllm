@@ -1222,6 +1222,8 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    kv_cache_retention_max_fraction: float = 1.0
+    """Maximum fraction of GPU blocks with request-level retention leases."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 

@@ -13,6 +13,7 @@ import torch
 
 import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+import vllm.v1.core.retained_block_queue as retained_block_queue
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -1667,6 +1668,63 @@ def test_cache_blocks(hash_fn):
     )
     assert len(block_pool.cached_block_hash_to_block) == 3
     assert blocks[0].block_hash is not None
+
+
+def test_retention_budget_is_atomic_and_reopens_after_expiry(monkeypatch):
+    block_size = 4
+    pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_max_fraction=0.4,
+    )
+    request = make_request(
+        "retention-budget",
+        list(range(3 * block_size)),
+        block_size,
+        sha256,
+    )
+    blocks = pool.get_new_blocks(3)
+    pool.cache_full_blocks(
+        request=request,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=3,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.free_blocks(blocks)
+    external_hashes = [
+        kv_cache_utils.maybe_convert_block_hash(block_hash)
+        for block_hash in request.block_hashes
+    ]
+
+    now = 100.0
+    monkeypatch.setattr(retained_block_queue.time, "monotonic", lambda: now)
+    assert pool.retain_external_blocks(
+        external_hashes[:2], "lease-1", priority=10, ttl_seconds=1
+    )
+    assert pool.retained_block_queue.num_retained_blocks == 2
+
+    # Reject the entire action instead of retaining an arbitrary subset.
+    assert not pool.retain_external_blocks(
+        external_hashes[1:], "lease-2", priority=10, ttl_seconds=10
+    )
+    assert pool.retained_block_queue.num_retained_blocks == 2
+    assert not pool.retained_block_queue.is_retained(blocks[2])
+
+    # Renewing blocks already counted against the cap remains valid.
+    assert pool.retain_external_blocks(
+        external_hashes[:2], "lease-3", priority=10, ttl_seconds=10
+    )
+    assert pool.retained_block_queue.num_retained_blocks == 2
+
+    now = 111.0
+    assert pool.retain_external_blocks(
+        external_hashes[2:], "lease-4", priority=10, ttl_seconds=10
+    )
+    assert pool.retained_block_queue.num_retained_blocks == 1
+    assert pool.retained_block_queue.is_retained(blocks[2])
 
 
 def test_cache_blocks_multi_group():

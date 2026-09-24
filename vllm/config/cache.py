@@ -162,6 +162,10 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    kv_cache_retention_max_fraction: float = Field(default=1.0, ge=0, le=1)
+    """Maximum fraction of physical GPU KV-cache blocks that may carry an
+    orchestrator-provided retention lease. Retain actions that would exceed
+    this worker-local limit are skipped atomically."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""

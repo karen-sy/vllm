@@ -133,6 +133,15 @@ class RetainedBlockQueue:
     def __len__(self) -> int:
         return len(self._free_blocks)
 
+    @property
+    def num_retained_blocks(self) -> int:
+        """Number of unique blocks carrying at least one live lease."""
+        return len(self._leases)
+
+    def is_retained(self, block: KVCacheBlock) -> bool:
+        """Return whether a block carries at least one live lease."""
+        return bool(self._leases.get(block.block_id))
+
     def _effective_priority(self, block_id: int) -> int:
         leases = self._leases.get(block_id)
         if not leases:

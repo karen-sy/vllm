@@ -1430,6 +1430,9 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            kv_cache_retention_max_fraction=(
+                vllm_config.cache_config.kv_cache_retention_max_fraction
+            ),
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1493,6 +1496,9 @@ def get_kv_cache_config_from_groups(
         kv_cache_groups=kv_cache_groups,
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        kv_cache_retention_max_fraction=(
+            vllm_config.cache_config.kv_cache_retention_max_fraction
         ),
     )
 

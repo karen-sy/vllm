@@ -653,12 +653,25 @@ class KVCacheManager:
         request: Request,
         block_hashes: tuple[ExternalBlockHash, ...],
         include_current_request: bool,
+        current_request_block_start: int | None = None,
+        current_request_block_count: int | None = None,
     ) -> tuple[ExternalBlockHash, ...]:
         resolved = dict.fromkeys(block_hashes)
         if include_current_request:
             resolved.update(
                 (maybe_convert_block_hash(block_hash), None)
                 for block_hash in request.block_hashes
+            )
+        if current_request_block_start is not None:
+            if current_request_block_count is None:
+                raise ValueError(
+                    "current_request_block_count is required when "
+                    "current_request_block_start is set"
+                )
+            stop = current_request_block_start + current_request_block_count
+            resolved.update(
+                (maybe_convert_block_hash(block_hash), None)
+                for block_hash in request.block_hashes[current_request_block_start:stop]
             )
         return tuple(resolved)
 
@@ -676,6 +689,8 @@ class KVCacheManager:
                     request,
                     action.block_hashes,
                     action.include_current_request,
+                    action.current_request_block_start,
+                    action.current_request_block_count,
                 ),
                 lease_id=(kv_hints.message_id, action.action_id),
                 priority=action.priority,

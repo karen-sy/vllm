@@ -102,6 +102,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            retention_max_fraction=(kv_cache_config.kv_cache_retention_max_fraction),
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
